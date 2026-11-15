@@ -35,6 +35,7 @@ import com.flx_apps.digitaldetox.ui.screens.feature.grayscale_apps.GrayscaleApps
 import com.flx_apps.digitaldetox.ui.screens.nav_host.NavViewModel
 import com.flx_apps.digitaldetox.util.AccessibilityEventUtil
 import com.flx_apps.digitaldetox.util.RecentEvents
+import com.flx_apps.digitaldetox.util.ShizukuUtils
 import timber.log.Timber
 
 const val DISPLAY_DALTONIZER_ENABLED = "accessibility_display_daltonizer_enabled"
@@ -521,10 +522,8 @@ object GrayscaleAppsFeature : Feature(), OnAppOpenedSubscriptionFeature,
             Settings.Secure.putInt(contentResolver, DISPLAY_DALTONIZER, defaultDaltonizer)
             isDaltonizerApplied = false
         }
-        if (isCurrentlyExtraDim) {
-            Settings.Secure.putInt(contentResolver, EXTRA_DIM, 0)
-            isCurrentlyExtraDim = false
-        }
+        // Also cancel any older in-flight Shizuku request to turn Extra Dim on.
+        writeExtraDim(context, false, force = true)
     }
 
     /**
@@ -538,14 +537,67 @@ object GrayscaleAppsFeature : Feature(), OnAppOpenedSubscriptionFeature,
      */
     private fun setExtraDim(
         context: Context, extraDim: Boolean
-    ): Boolean {
-        if (isCurrentlyExtraDim == extraDim) return true
-        val contentResolver = context.contentResolver
-        val result = Settings.Secure.putInt(
-            contentResolver, EXTRA_DIM, if (extraDim) 1 else 0
-        )
-        if (result) isCurrentlyExtraDim = extraDim
-        return result
+    ): Boolean = writeExtraDim(context, extraDim)
+
+    /**
+     * Try the ordinary Settings API first. Some Android implementations perform a hidden-key
+     * readability check during putInt(EXTRA_DIM) and throw SecurityException, even when the app
+     * has WRITE_SECURE_SETTINGS. A Shizuku shell can still perform the operation on those devices.
+     *
+     * Shizuku commands finish asynchronously. Only one is allowed in flight, and the latest
+     * requested state is applied afterward so an old "off" cannot overwrite a newer "on".
+     * The cached state changes only after a confirmed successful write.
+     */
+    private val extraDimWriteLock = Any()
+    private var pendingExtraDimWrite: Boolean? = null
+    private var latestExtraDimRequest: Boolean? = null
+
+    private fun writeExtraDim(context: Context, enabled: Boolean, force: Boolean = false): Boolean {
+        synchronized(extraDimWriteLock) {
+            if (pendingExtraDimWrite != null) {
+                latestExtraDimRequest = enabled
+                return true // queued behind the in-flight shell command
+            }
+            if (!force && isCurrentlyExtraDim == enabled) return true
+
+            val directResult = try {
+                Settings.Secure.putInt(context.contentResolver, EXTRA_DIM, if (enabled) 1 else 0)
+            } catch (e: SecurityException) {
+                Timber.w(e, "Direct Extra Dim write rejected; trying Shizuku")
+                null
+            }
+            if (directResult != null) {
+                if (directResult) isCurrentlyExtraDim = enabled
+                return directResult
+            }
+
+            if (!ShizukuUtils.canExecuteCommandsSilently()) {
+                Timber.w("Cannot change Extra Dim: Shizuku is unavailable or not authorized")
+                return false
+            }
+            pendingExtraDimWrite = enabled
+            latestExtraDimRequest = enabled
+        }
+
+        val appContext = context.applicationContext
+        ShizukuUtils.executeCommand(
+            "settings put secure reduce_bright_colors_activated ${if (enabled) 1 else 0}"
+        ) { success, output ->
+            var nextRequest: Boolean? = null
+            synchronized(extraDimWriteLock) {
+                pendingExtraDimWrite = null
+                if (success) {
+                    isCurrentlyExtraDim = enabled
+                } else {
+                    Timber.w("Extra Dim Shizuku write failed: %s", output)
+                }
+                // If the desired state changed while Shizuku was running, apply the newest one.
+                val latest = latestExtraDimRequest
+                if (latest != enabled) nextRequest = latest
+            }
+            nextRequest?.let { writeExtraDim(appContext, it) }
+        }
+        return true // accepted for asynchronous execution, not yet confirmed
     }
 
     /**
